@@ -1,0 +1,6 @@
+node_modules
+.env
+vercel.json
+Oldindex.js
+keyconverter.js
+zap-shift-firebase-adminsdk.json
