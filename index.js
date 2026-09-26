@@ -27,6 +27,26 @@ const uri = `mongodb+srv://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}
 // Stripe
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
+// PayPal
+const paypal = require('@paypal/checkout-server-sdk');
+const paypalEnvironment =
+    process.env.NODE_ENV === 'production'
+        ? new paypal.core.LiveEnvironment(
+            process.env.PAYPAL_CLIENT_ID,
+            process.env.PAYPAL_CLIENT_SECRET
+        )
+        : new paypal.core.SandboxEnvironment(
+            process.env.PAYPAL_CLIENT_ID,
+            process.env.PAYPAL_CLIENT_SECRET
+        );
+
+const paypalClient = new paypal.core.PayPalHttpClient(
+    paypalEnvironment
+);
+//Paypal
+
+
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -59,7 +79,7 @@ const client = new MongoClient(uri, {
 });
 
 // ---- MongoDB collections (assigned once connect() resolves) ----
-let usersCollection, parcelsCollection, paymentsCollection, ridersCollection, trackingsCollection;
+let usersCollection, parcelsCollection, paymentsCollection, ridersCollection, trackingsCollection, reviewsCollection;
 
 // This promise is awaited at the top of every route handler below,
 // so a request that arrives before the DB is ready simply waits
@@ -72,7 +92,9 @@ const dbConnectionPromise = client.connect()
         paymentsCollection = db.collection('payments');
         ridersCollection = db.collection('riders');
         trackingsCollection = db.collection('trackings');
-        // console.log('MongoDB connected successfully');
+        reviewsCollection = db.collection('reviews');
+        coverageCollection = db.collection('coverages');
+        console.log('MongoDB connected successfully');
     })
     .catch((error) => {
         console.error('MongoDB connection failed:', error);
@@ -386,7 +408,7 @@ app.delete('/riders/:id', verifyFBtoken, verifyAdmin, async (req, res) => {
     res.send(result);
 })
 
-//Parcel API
+//Parcel API Email Base
 app.get('/parcels', verifyFBtoken, async (req, res) => {
     const query = {};
     const { email, deliveryStatus } = req.query;
@@ -402,6 +424,28 @@ app.get('/parcels', verifyFBtoken, async (req, res) => {
     const result = await cursor.toArray();
     res.send(result);
 })
+app.get('/allParcels', verifyFBtoken, verifyAdmin, async (req, res) => {
+     const searchText = req.query.searchText;
+     const query = {};
+
+    if (req.query.deliveryStatus) {
+        query.deliveryStatus = req.query.deliveryStatus;
+    }
+    if (searchText) {
+        query.$or = [
+            { parcelName: { $regex: searchText, $options: 'i' } },
+            { receiverEmail: { $regex: searchText, $options: 'i' } },
+            { receiverName: { $regex: searchText, $options: 'i' } }
+        ]
+    }
+
+    const result = await parcelsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .toArray();
+
+    res.send(result);
+});
 
 //Parcels Api Aggregation for dashboard
 app.get('/parcels/delivery-status/states', async (req, res) => {
@@ -666,6 +710,275 @@ app.get('/payments-history', verifyFBtoken, async (req, res) => {
 
     res.send(result);
 })
+
+//Paypal Payment
+
+// PayPal Create Order
+app.post('/create-paypal-order', async (req, res) => {
+    try {
+        const paymentInfo = req.body;
+
+        // PayPal uses USD
+        const amount = Number(paymentInfo.cost).toFixed(2);
+
+        const request = new paypal.orders.OrdersCreateRequest();
+
+        request.prefer("return=representation");
+
+        request.requestBody({
+            intent: 'CAPTURE',
+
+            purchase_units: [
+                {
+                    amount: {
+                        currency_code: 'USD',
+                        value: amount,
+                    },
+
+                    description: paymentInfo.parcelName,
+
+                    custom_id: paymentInfo.parcelId,
+                }
+            ]
+        });
+
+        const order = await paypalClient.execute(request);
+
+        console.log('Paypal Payment', order);
+
+        res.send({
+            success: true,
+            id: order.result.id,
+        });
+
+    } catch (error) {
+        console.error('PayPal Create Order Error:', error);
+
+        res.status(500).send({
+            success: false,
+            message: 'Failed to create PayPal order',
+            error: error.message,
+        });
+    }
+});
+
+// PayPal Capture Order
+app.post('/capture-paypal-order', async (req, res) => {
+    try {
+        const {
+            orderId,
+            parcelId,
+            parcelName,
+            senderEmail,
+            cost,
+            trackingId
+        } = req.body;
+
+        const request = new paypal.orders.OrdersCaptureRequest(orderId);
+
+        request.requestBody({});
+
+        const order = await paypalClient.execute(request);
+
+        const capture =
+            order.result.purchase_units?.[0]?.payments?.captures?.[0];
+
+        if (!capture || capture.status !== 'COMPLETED') {
+            return res.status(400).send({
+                success: false,
+                message: 'PayPal payment was not completed.'
+            });
+        }
+
+        const transactionId = capture.id;
+
+        // Prevent duplicate payment
+        const paymentExist = await paymentsCollection.findOne({
+            transactionId
+        });
+
+        if (paymentExist) {
+            return res.send({
+                success: true,
+                message: 'Already Exist.',
+                transactionId,
+                trackingId: paymentExist.trackingId
+            });
+        }
+
+        // Update parcel
+        const parcelFilter = {
+            _id: new ObjectId(parcelId)
+        };
+
+        const parcelUpdate = {
+            $set: {
+                paymentStatus: 'paid',
+                paymentDate: new Date(),
+                trackingId: trackingId,
+                deliveryStatus: 'pending-pickup'
+            }
+        };
+
+        const parcelResult =
+            await parcelsCollection.updateOne(
+                parcelFilter,
+                parcelUpdate
+            );
+
+        // Save payment
+        const payment = {
+            parcelId,
+            parcelName,
+            senderEmail,
+            amount: Number(cost),
+            currency: 'USD',
+            paymentMethod: 'paypal',
+            transactionId,
+            paymentDate: new Date(),
+            trackingId,
+        };
+
+        const paymentResult =
+            await paymentsCollection.insertOne(payment);
+
+        // Tracking
+        await logtracking(
+            trackingId,
+            'pending-pickup'
+        );
+
+        res.send({
+            success: true,
+            transactionId,
+            trackingId,
+            modifyParcel: parcelResult,
+            paymentInfo: paymentResult
+        });
+
+    } catch (error) {
+        console.error('PayPal Capture Error:', error);
+
+        res.status(500).send({
+            success: false,
+            message: 'Failed to capture PayPal payment',
+            error: error.message,
+        });
+    }
+});
+
+//Paypal Payment
+
+
+
+//Review API
+app.get('/reviews', async(req, res)=>{
+    const cursor =  reviewsCollection.find();
+    const result = await cursor.toArray();
+    res.send(result);
+})
+app.post('/reviews', async(req, res)=>{
+    const reviews = req.body;
+    reviews.createdAt = new Date();
+    const result = await reviewsCollection.insertOne(reviews);
+    res.send(result);
+})
+app.get('/reviews/:id', async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id: new ObjectId(id)};
+    const result = await reviewsCollection.findOne(query);
+    res.send(result);
+})
+app.patch('/reviews/:id',async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id: new ObjectId(id)};
+    const newReview = req.body;
+      const updatedDoc = {
+        $set: {
+            name: newReview.name,
+            review: newReview.review,
+            rating: newReview.rating,
+            image: newReview.image,
+            updatedAt: new Date()
+        }
+    }
+    const result = await reviewsCollection.updateOne(query, updatedDoc);
+    res.send(result);
+})
+app.delete('/reviews/:id', async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id: new ObjectId(id)};
+    const result = await reviewsCollection.deleteOne(query);
+    res.send(result);
+})
+
+
+//Coverage Area
+app.get('/coverage', async(req, res)=>{
+    const cursor = coverageCollection.find();
+    const result = await cursor.toArray();
+    res.send(result);
+})
+app.post('/coverage', async(req, res)=>{
+    const coverage = req.body;
+    coverage.createdAt = new Date();
+    const result = await coverageCollection.insertOne(coverage);
+    res.send(result);
+})
+app.get('/coverage/:id', async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id: new ObjectId(id)};
+    const result =  await coverageCollection.findOne(query);
+    res.send(result);
+})
+app.patch('/coverage/:id', async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id: new ObjectId(id)};
+    const newCoverage = req.body;
+    const updateCoverage = {
+        $set:{
+            region: newCoverage.region,
+            district: newCoverage.district,
+            city: newCoverage.city,
+            covered_area: newCoverage.covered_area,
+            status: newCoverage.status,
+            flowchart: newCoverage.flowchart,
+            longitude: newCoverage.longitude,
+            latitude: newCoverage.latitude,
+            updatedAt: new Date()
+        }
+    }
+   const result = await coverageCollection.updateOne(query, updateCoverage);
+    res.send(result);
+})
+app.delete('/coverage/:id', async(req, res)=>{
+    const id = req.params.id;
+    const query = {_id : new ObjectId(id)};
+    const result = await coverageCollection.deleteOne(query);
+    res.send(result);
+})
+
+
+// User Update Profile API
+app.patch('/profileUpdate', async (req, res) => {
+    const email = req.query.email;
+
+    const updateData = {
+        $set: {
+            displayName: req.body.displayName,
+            phone: req.body.phone,
+            address: req.body.address,
+            photoURL: req.body.photoURL,
+        }
+    };
+
+    const result = await usersCollection.updateOne(
+        { email: email },
+        updateData
+    );
+
+    res.send(result);
+});
 
 // Only run a traditional listening server for local development.
 // On Vercel, the exported `app` is used directly as a serverless function.
