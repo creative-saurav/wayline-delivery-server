@@ -146,7 +146,7 @@ const logtracking = async (trackingId, status) => {
 }
 
 app.get('/', (req, res) => {
-    res.send('Zap Shifting Server is running!');
+    res.send('Wayline Delivery Server is running!');
 });
 
 //User Api
